@@ -1,19 +1,25 @@
 // Package producthunt is a Go client for Product Hunt's GraphQL API.
 //
-// Two authentication modes are supported:
+// Three authentication modes are supported (in priority order):
 //
-// Developer token (recommended for reads):
+// 1. Developer token (BYOK — full user context, never expires):
 //
-//	c, err := producthunt.New(producthunt.Cookies{
-//	    DeveloperToken: "your-token-from-producthunt.com/v2/oauth/applications",
+//	c, err := producthunt.New(producthunt.Credentials{
+//	    DeveloperToken: "your-token",
 //	})
 //
-// Browser cookies (required for writes — upvote, comment, follow):
+// 2. Client credentials (auto-provisioned, public scope):
 //
-//	c, err := producthunt.New(producthunt.Cookies{
-//	    Session:     "HgMBNVq0dc44...",
-//	    CFClearance: "abc123...",
-//	    CSRFToken:   "WGqV7WPA...",
+//	c, err := producthunt.New(producthunt.Credentials{
+//	    ClientID:     "your-client-id",
+//	    ClientSecret: "your-client-secret",
+//	})
+//
+// 3. Browser cookies (frontend API, requires Cloudflare bypass):
+//
+//	c, err := producthunt.New(producthunt.Credentials{
+//	    Session:   "HgMBNVq0dc44...",
+//	    CSRFToken: "WGqV7WPA...",
 //	})
 //
 // Example:

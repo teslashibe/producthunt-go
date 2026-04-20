@@ -18,6 +18,7 @@ import (
 const (
 	frontendEndpoint = "https://www.producthunt.com/frontend/graphql"
 	v2Endpoint       = "https://api.producthunt.com/v2/api/graphql"
+	tokenEndpoint    = "https://api.producthunt.com/v2/oauth/token"
 	phOrigin         = "https://www.producthunt.com"
 	phReferer        = "https://www.producthunt.com/"
 	defaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
@@ -29,9 +30,10 @@ const (
 
 // Client is a Product Hunt API client. It is safe for concurrent use.
 type Client struct {
-	cookies    Cookies
+	creds      Credentials
+	token      string // resolved bearer token (from BYOK, client_credentials, or empty)
 	endpoint   string // resolved API endpoint (v2 or frontend)
-	useBearer  bool   // true when using developer token + v2 API
+	useBearer  bool   // true when using bearer token + v2 API
 	httpClient *http.Client
 	userAgent  string
 	minGap     time.Duration
@@ -42,35 +44,24 @@ type Client struct {
 	lastReqAt time.Time
 }
 
-// New constructs a Client and validates the session by calling GetViewer.
+// New constructs a Client using the provided credentials.
 //
-// If Cookies.DeveloperToken is set, the client uses the public v2 API
-// (api.producthunt.com) with Bearer token auth — no Cloudflare issues.
+// Authentication is resolved in priority order:
 //
-// If only Cookies.Session is set, the client uses the internal frontend API
-// (www.producthunt.com/frontend/graphql) with cookie auth. This requires a
-// cf_clearance cookie or TLS fingerprint spoofing to bypass Cloudflare.
+//  1. DeveloperToken (BYOK): uses the v2 API with Bearer auth, full user
+//     context, never expires. Get one at producthunt.com/v2/oauth/applications.
 //
-// Returns ErrInvalidAuth if neither DeveloperToken nor Session is provided.
-func New(cookies Cookies, opts ...Option) (*Client, error) {
-	hasDev := strings.TrimSpace(cookies.DeveloperToken) != ""
-	hasSess := strings.TrimSpace(cookies.Session) != ""
-
-	if !hasDev && !hasSess {
-		return nil, fmt.Errorf("%w: either DeveloperToken or Session cookie must be non-empty", ErrInvalidAuth)
-	}
-
-	endpoint := frontendEndpoint
-	useBearer := false
-	if hasDev {
-		endpoint = v2Endpoint
-		useBearer = true
-	}
-
+//  2. ClientID + ClientSecret: calls the OAuth client_credentials endpoint to
+//     obtain an access token automatically. Public scope only (no viewer).
+//
+//  3. Session cookie: uses the internal frontend API with cookie auth.
+//     Requires Cloudflare bypass.
+//
+// The constructor validates the auth by making a test API call.
+// Returns ErrInvalidAuth if no valid credentials are provided.
+func New(creds Credentials, opts ...Option) (*Client, error) {
 	c := &Client{
-		cookies:    cookies,
-		endpoint:   endpoint,
-		useBearer:  useBearer,
+		creds:      creds,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		userAgent:  defaultUserAgent,
 		minGap:     defaultMinGap,
@@ -81,11 +72,104 @@ func New(cookies Cookies, opts ...Option) (*Client, error) {
 		o(c)
 	}
 
-	if _, err := c.GetViewer(context.Background()); err != nil {
+	if err := c.resolveAuth(); err != nil {
 		return nil, err
+	}
+
+	// Validate auth with a lightweight test query.
+	ctx := context.Background()
+	if c.useBearer {
+		data, err := c.query(ctx, "TestQuery", `{ posts(first: 1) { totalCount } }`, nil)
+		if err != nil {
+			return nil, fmt.Errorf("%w: auth validation failed: %v", ErrUnauthorized, err)
+		}
+		_ = data
+	} else {
+		if _, err := c.GetViewer(ctx); err != nil {
+			return nil, err
+		}
 	}
 	return c, nil
 }
+
+// resolveAuth determines the auth mode and obtains a bearer token if needed.
+func (c *Client) resolveAuth() error {
+	// Priority 1: BYOK developer token
+	if t := strings.TrimSpace(c.creds.DeveloperToken); t != "" {
+		c.token = t
+		c.endpoint = v2Endpoint
+		c.useBearer = true
+		return nil
+	}
+
+	// Priority 2: client credentials → auto-provision token
+	cid := strings.TrimSpace(c.creds.ClientID)
+	csec := strings.TrimSpace(c.creds.ClientSecret)
+	if cid != "" && csec != "" {
+		token, err := c.fetchClientToken(cid, csec)
+		if err != nil {
+			return fmt.Errorf("%w: client_credentials flow failed: %v", ErrUnauthorized, err)
+		}
+		c.token = token
+		c.endpoint = v2Endpoint
+		c.useBearer = true
+		return nil
+	}
+
+	// Priority 3: browser session cookies
+	if strings.TrimSpace(c.creds.Session) != "" {
+		c.endpoint = frontendEndpoint
+		c.useBearer = false
+		return nil
+	}
+
+	return fmt.Errorf("%w: provide DeveloperToken, ClientID+ClientSecret, or Session cookie", ErrInvalidAuth)
+}
+
+// fetchClientToken exchanges client credentials for an access token.
+func (c *Client) fetchClientToken(clientID, clientSecret string) (string, error) {
+	body, err := json.Marshal(map[string]string{
+		"client_id":     clientID,
+		"client_secret": clientSecret,
+		"grant_type":    "client_credentials",
+	})
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, tokenEndpoint, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("token request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("token endpoint returned %d: %s", resp.StatusCode, truncate(string(respBody), 200))
+	}
+
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+		Scope       string `json:"scope"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		return "", fmt.Errorf("decoding token response: %w", err)
+	}
+	if tokenResp.AccessToken == "" {
+		return "", fmt.Errorf("empty access_token in response")
+	}
+	return tokenResp.AccessToken, nil
+}
+
+// Token returns the current bearer token, if any. Useful for debugging.
+func (c *Client) Token() string { return c.token }
 
 // Option configures a Client.
 type Option func(*Client)
@@ -245,14 +329,14 @@ func (c *Client) setHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", c.userAgent)
 
 	if c.useBearer {
-		req.Header.Set("Authorization", "Bearer "+c.cookies.DeveloperToken)
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	} else {
 		req.Header.Set("Origin", phOrigin)
 		req.Header.Set("Referer", phReferer)
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		req.Header.Set("Cookie", c.cookieHeader())
-		if c.cookies.CSRFToken != "" {
-			req.Header.Set("X-CSRF-Token", c.cookies.CSRFToken)
+		if c.creds.CSRFToken != "" {
+			req.Header.Set("X-CSRF-Token", c.creds.CSRFToken)
 		}
 	}
 }
@@ -270,11 +354,10 @@ func (c *Client) cookieHeader() string {
 		b.WriteByte('=')
 		b.WriteString(val)
 	}
-	add("_producthunt_session_production", c.cookies.Session)
-	add("cf_clearance", c.cookies.CFClearance)
-	add("__cf_bm", c.cookies.CFBM)
-	add("csrf_token", c.cookies.CSRFToken)
-	add("_ph_id", c.cookies.PHID)
+	add("_producthunt_session_production", c.creds.Session)
+	add("cf_clearance", c.creds.CFClearance)
+	add("__cf_bm", c.creds.CFBM)
+	add("csrf_token", c.creds.CSRFToken)
 	return b.String()
 }
 

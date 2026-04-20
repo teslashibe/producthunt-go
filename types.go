@@ -2,29 +2,36 @@ package producthunt
 
 import "time"
 
-// Cookies holds the Product Hunt session credentials.
+// Credentials holds Product Hunt authentication credentials.
 //
-// Two authentication modes are supported:
+// Three authentication modes are supported (in priority order):
 //
-// 1. Developer token (recommended): Set DeveloperToken to the token from
-//    https://www.producthunt.com/v2/oauth/applications — uses the v2 API
-//    at api.producthunt.com, no Cloudflare issues, never expires.
+// 1. Developer token (BYOK): Set DeveloperToken to a token from
+//    https://www.producthunt.com/v2/oauth/applications — never expires,
+//    full user context, no Cloudflare issues.
 //
-// 2. Browser cookies: Set Session (and optionally CFClearance/CFBM/CSRFToken)
-//    from a browser session export — uses the internal frontend API at
-//    www.producthunt.com/frontend/graphql. Requires Cloudflare bypass
-//    (cf_clearance cookie or TLS fingerprint spoofing).
+// 2. Client credentials: Set ClientID + ClientSecret from the same page.
+//    The client calls the OAuth token endpoint on construction to obtain
+//    an access token automatically. Public scope only (no user context).
 //
-// If DeveloperToken is set it takes priority. Write operations (upvote,
-// comment, follow) require either a user-scoped OAuth token or browser cookies.
-type Cookies struct {
-	DeveloperToken string // OAuth2 developer token (v2 API — recommended for reads)
-	Session        string // _producthunt_session_production
+// 3. Browser cookies: Set Session (and CSRFToken) from a browser export.
+//    Used for the frontend API (www.producthunt.com/frontend/graphql).
+//    Requires Cloudflare bypass (cf_clearance or TLS fingerprint spoofing).
+//
+// If DeveloperToken is set it takes priority over ClientID/ClientSecret,
+// which in turn takes priority over browser cookies.
+type Credentials struct {
+	DeveloperToken string // BYOK: OAuth2 developer token (v2 API, user scope, never expires)
+	ClientID       string // OAuth2 client ID (for auto-provisioned client_credentials flow)
+	ClientSecret   string // OAuth2 client secret
+	Session        string // _producthunt_session_production (browser cookie)
 	CFClearance    string // cf_clearance (Cloudflare challenge clearance)
 	CFBM           string // __cf_bm (Cloudflare bot management)
 	CSRFToken      string // csrf_token (Rails CSRF — needed for mutations via frontend API)
-	PHID           string // _ph_id (optional, analytics)
 }
+
+// Cookies is an alias for Credentials for backward compatibility.
+type Cookies = Credentials
 
 // Post is a product launched on Product Hunt.
 type Post struct {

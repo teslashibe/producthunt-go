@@ -2,11 +2,14 @@
 //
 // Usage:
 //
-//	# With developer token (recommended):
-//	PH_DEV_TOKEN=your-token go run ./cmd/probe
+//	# Developer token (BYOK):
+//	PH_DEV_TOKEN=xxx go run ./cmd/probe
 //
-//	# With browser cookies (needs Cloudflare bypass):
-//	PH_SESSION=cookie-value PH_CF_CLEARANCE=cookie-value go run ./cmd/probe
+//	# Client credentials (auto-provision):
+//	PH_CLIENT_ID=xxx PH_CLIENT_SECRET=xxx go run ./cmd/probe
+//
+//	# Browser cookies:
+//	PH_SESSION=xxx go run ./cmd/probe
 package main
 
 import (
@@ -19,34 +22,36 @@ import (
 )
 
 func main() {
-	cookies := producthunt.Cookies{
+	creds := producthunt.Credentials{
 		DeveloperToken: os.Getenv("PH_DEV_TOKEN"),
+		ClientID:       os.Getenv("PH_CLIENT_ID"),
+		ClientSecret:   os.Getenv("PH_CLIENT_SECRET"),
 		Session:        os.Getenv("PH_SESSION"),
 		CFClearance:    os.Getenv("PH_CF_CLEARANCE"),
 		CFBM:           os.Getenv("PH_CF_BM"),
 		CSRFToken:      os.Getenv("PH_CSRF_TOKEN"),
 	}
 
-	if cookies.DeveloperToken == "" && cookies.Session == "" {
-		fmt.Fprintln(os.Stderr, "Set PH_DEV_TOKEN or PH_SESSION env var")
-		fmt.Fprintln(os.Stderr, "Get a developer token at: https://www.producthunt.com/v2/oauth/applications")
+	if creds.DeveloperToken == "" && creds.ClientID == "" && creds.Session == "" {
+		fmt.Fprintln(os.Stderr, "Set one of: PH_DEV_TOKEN, PH_CLIENT_ID+PH_CLIENT_SECRET, or PH_SESSION")
+		fmt.Fprintln(os.Stderr, "Get credentials at: https://www.producthunt.com/v2/oauth/applications")
 		os.Exit(1)
 	}
 
 	fmt.Println("=== Creating client...")
-	c, err := producthunt.New(cookies, producthunt.WithRateLimit(500*time.Millisecond))
+	c, err := producthunt.New(creds, producthunt.WithRateLimit(500*time.Millisecond))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "New() failed: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("✓ Client created successfully")
+	fmt.Println("  Client created (token:", truncate(c.Token(), 12), ")")
 
 	ctx := context.Background()
 
 	fmt.Println("\n=== GetViewer")
 	viewer, err := c.GetViewer(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "GetViewer: %v\n", err)
+		fmt.Printf("  (no user context — public scope)\n")
 	} else {
 		fmt.Printf("  ID:       %s\n", viewer.ID)
 		fmt.Printf("  Username: %s\n", viewer.Username)
@@ -57,7 +62,7 @@ func main() {
 	fmt.Println("\n=== GetHomefeed (top 5)")
 	feed, err := c.GetHomefeed(ctx, producthunt.WithPostListFirst(5))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "GetHomefeed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "  GetHomefeed: %v\n", err)
 	} else {
 		fmt.Printf("  Total: %d, HasNext: %v\n", feed.TotalCount, feed.HasNext)
 		for i, p := range feed.Items {
@@ -68,7 +73,7 @@ func main() {
 	fmt.Println("\n=== GetTopics (top 5)")
 	topics, err := c.GetTopics(ctx, producthunt.WithTopicsOrder(producthunt.TopicsOrderFollowers))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "GetTopics: %v\n", err)
+		fmt.Fprintf(os.Stderr, "  GetTopics: %v\n", err)
 	} else {
 		for i, t := range topics.Items {
 			if i >= 5 {
@@ -79,4 +84,11 @@ func main() {
 	}
 
 	fmt.Println("\n=== Done")
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
