@@ -40,8 +40,10 @@ type Client struct {
 	maxRetries int
 	retryBase  time.Duration
 
-	mu        sync.Mutex
+	gapMu     sync.Mutex
 	lastReqAt time.Time
+	rlMu      sync.Mutex
+	rlState   RateLimitState
 }
 
 // New constructs a Client using the provided credentials.
@@ -277,6 +279,8 @@ func (c *Client) doQuery(ctx context.Context, operationName, gqlQuery string, va
 	}
 	defer resp.Body.Close()
 
+	c.updateRateLimit(resp.Header)
+
 	switch {
 	case resp.StatusCode == http.StatusOK:
 		// handled below
@@ -292,12 +296,20 @@ func (c *Client) doQuery(ctx context.Context, operationName, gqlQuery string, va
 		return nil, ErrNotFound
 	case resp.StatusCode == http.StatusTooManyRequests:
 		wait := parseRetryAfter(resp.Header.Get("Retry-After"), 60*time.Second)
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(wait):
+		c.updateRateLimit(resp.Header)
+		c.rlMu.Lock()
+		c.rlState.Remaining = 0
+		c.rlState.RetryAfter = wait
+		if c.rlState.Reset.IsZero() || time.Until(c.rlState.Reset) < wait {
+			c.rlState.Reset = time.Now().Add(wait)
 		}
-		return nil, ErrRateLimited
+		c.rlMu.Unlock()
+		c.gapMu.Lock()
+		if earliest := time.Now().Add(wait); c.lastReqAt.Before(earliest) {
+			c.lastReqAt = earliest
+		}
+		c.gapMu.Unlock()
+		return nil, fmt.Errorf("%w: retry after %s", ErrRateLimited, wait)
 	case resp.StatusCode >= 500:
 		return nil, fmt.Errorf("%w: HTTP %d", ErrRequestFailed, resp.StatusCode)
 	default:
@@ -362,20 +374,25 @@ func (c *Client) cookieHeader() string {
 }
 
 func (c *Client) waitForGap(ctx context.Context) {
-	c.mu.Lock()
-	since := time.Since(c.lastReqAt)
-	if since < c.minGap {
-		wait := c.minGap - since
-		c.mu.Unlock()
+	gap := c.adaptiveGap()
+	c.gapMu.Lock()
+	now := time.Now()
+	next := c.lastReqAt.Add(gap)
+	if now.After(next) {
+		next = now
+	}
+	c.lastReqAt = next
+	c.gapMu.Unlock()
+
+	if wait := time.Until(next); wait > 0 {
 		select {
 		case <-ctx.Done():
-			return
 		case <-time.After(wait):
 		}
-		c.mu.Lock()
 	}
-	c.lastReqAt = time.Now()
-	c.mu.Unlock()
+	c.rlMu.Lock()
+	c.rlState.RetryAfter = 0
+	c.rlMu.Unlock()
 }
 
 func isNonRetriable(err error) bool {
@@ -393,14 +410,82 @@ func isNonRetriable(err error) bool {
 	return false
 }
 
+// RateLimit returns a snapshot of the most recently observed rate-limit state.
+func (c *Client) RateLimit() RateLimitState {
+	c.rlMu.Lock()
+	defer c.rlMu.Unlock()
+	return c.rlState
+}
+
+func (c *Client) updateRateLimit(h http.Header) {
+	c.rlMu.Lock()
+	defer c.rlMu.Unlock()
+	if v := rlHeader(h, "Limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.rlState.Limit = n
+		}
+	}
+	if v := rlHeader(h, "Remaining"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.rlState.Remaining = n
+		}
+	}
+	if v := rlHeader(h, "Reset"); v != "" {
+		if ts, err := strconv.ParseInt(v, 10, 64); err == nil {
+			if ts > 1_000_000_000 {
+				c.rlState.Reset = time.Unix(ts, 0)
+			} else {
+				c.rlState.Reset = time.Now().Add(time.Duration(ts) * time.Second)
+			}
+		}
+	}
+}
+
+func rlHeader(h http.Header, suffix string) string {
+	for _, p := range []string{"X-RateLimit-", "X-Rate-Limit-", "X-Ratelimit-", "RateLimit-"} {
+		if v := strings.TrimSpace(h.Get(p + suffix)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func (c *Client) adaptiveGap() time.Duration {
+	c.rlMu.Lock()
+	rs := c.rlState
+	c.rlMu.Unlock()
+
+	if rs.Remaining == 0 && !rs.Reset.IsZero() {
+		if d := time.Until(rs.Reset); d > 0 {
+			return d + 50*time.Millisecond
+		}
+	}
+	if rs.Remaining > 0 && !rs.Reset.IsZero() {
+		if d := time.Until(rs.Reset); d > 0 {
+			spread := d / time.Duration(float64(rs.Remaining)*0.9)
+			if spread > c.minGap {
+				return spread
+			}
+		}
+	}
+	return c.minGap
+}
+
 func parseRetryAfter(val string, fallback time.Duration) time.Duration {
 	if val == "" {
 		return fallback
 	}
-	if secs, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
-		return time.Duration(secs) * time.Second
+	trimmed := strings.TrimSpace(val)
+	if n, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		if n > 1_000_000_000 {
+			if d := time.Until(time.Unix(n, 0)); d > 0 {
+				return d
+			}
+			return fallback
+		}
+		return time.Duration(n) * time.Second
 	}
-	if t, err := http.ParseTime(val); err == nil {
+	if t, err := http.ParseTime(trimmed); err == nil {
 		if d := time.Until(t); d > 0 {
 			return d
 		}
