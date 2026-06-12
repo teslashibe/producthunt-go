@@ -44,3 +44,11 @@ func (c *Client) GetViewer(ctx context.Context) (*User, error) {
 	u.IsViewer = true
 	return &u, nil
 }
+
+// GetMe is a liveness alias for GetViewer. Hosts probe a credential's health
+// by calling GetMe(ctx) (the smore liveness prober adapts any
+// GetMe(ctx) (..., error) method into a HealthCheck), so this lets a stored
+// Product Hunt developer token be verified as live, not merely present.
+func (c *Client) GetMe(ctx context.Context) (*User, error) {
+	return c.GetViewer(ctx)
+}
